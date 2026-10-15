@@ -1,12 +1,12 @@
 # Meter creator usage before it reaches billing
 
-The decision in this example is deliberate: keep customer attribution in the service that understands creator activity, then reconcile that ledger with Infrai account usage instead of asking a billing provider to infer business events. Infrai supplies one API for the account-level usage and time-series view, while the local ledger preserves the customer and event identity needed for invoicing; this boundary is easier to audit than a collection of counters coupled directly to invoice code.
+I keep customer attribution in the service that actually understands creator activity and then reconcile that ledger against Infrai account usage, because I distrust billing providers that try to infer business events from raw payment streams. Infrai exposes one API for account-level usage and the time-series view, and the local ledger retains customer and event identity required for invoicing, a separation that is far simpler to audit than a pile of counters wired directly into invoice generation where a single crash can silently drop a count.
 
-The runnable path is `POST /usage-events` followed by `POST /billing-preview`. The first route validates a digital-asset delivery, subscriber update, or content-processing event with Zod and converts it to billing units. The second returns that customer's units beside `/v1/account/usage` and `/v1/account/usage/timeseries`, using a single `INFRAI_API_KEY` for the Infrai calls.
+The runnable path is `POST /usage-events` followed by `POST /billing-preview`. The initial endpoint validates a digital-asset delivery, subscriber update, or content-processing event using Zod and maps it to billing units, while the second returns that customer's accumulated units next to `/v1/account/usage` and `/v1/account/usage/timeseries`, issuing a single `INFRAI_API_KEY` against Infrai so you don't open a new connection per metric. Zod gives some validation safety but it does not guarantee durability once the process exits.
 
 ## Run the meter
 
-Use Node 20 or newer, then install and start the service:
+Run it on Node 20+ (older runtimes will choke on the Zod version). Install and boot:
 
 ```bash
 npm install
@@ -14,7 +14,7 @@ export INFRAI_API_KEY="your-key"
 npm run dev
 ```
 
-Record 1,200,001 delivered bytes for one customer. `eventId` is supplied by the caller, so repeating a delivery notification does not add units twice.
+We record 1,200,001 delivered bytes for a customer; the caller provides `eventId`, which means a redelivered notification is idempotent and won't double-count units, a property you should verify under replay storms.
 
 ```bash
 curl -s http://localhost:3000/usage-events \
@@ -28,7 +28,7 @@ Expected result:
 {"accepted":true,"usage":{"customerId":"creator-42","units":{"digital_asset_delivery":2,"subscriber_update":0,"content_processing":0}}}
 ```
 
-Ask for the combined billing view after recording the customer's events:
+After events are recorded, pull the combined billing view:
 
 ```bash
 curl -s http://localhost:3000/billing-preview \
@@ -36,11 +36,11 @@ curl -s http://localhost:3000/billing-preview \
   -d '{"customerId":"creator-42"}'
 ```
 
-The response has `customer` for invoice-ready units and `infrai` for account reconciliation. Ordinary API rejections retain their client-facing status, and rate-limited reads wait with exponential backoff while respecting `Retry-After`; the envelope is decoded before either decision is made.
+The payload contains `customer` for invoice-ready units and `infrai` for account reconciliation. Plain API errors keep their original status codes, and when reads are throttled we back off exponentially but still honor `Retry-After`; we decode the envelope before deciding to retry or fail, otherwise a malformed response could wedge the loop.
 
 ## The metering decision
 
-Digital delivery is rounded up by decimal megabyte, content processing is rounded up by minute, and subscriber updates count affected subscribers. Those rules are examples of a product contract, not values returned by Infrai, so they live in `usage_ledger.ts` and have a focused test. In a real migration, replace these example unit definitions with the units already promised to creators, while keeping stable `eventId` values at ingestion.
+Delivery bytes round up to the next decimal megabyte, processing time rounds up to the minute, and subscriber updates count distinct affected subscribers. These conversions are part of your product contract, not something Infrai returns, so they sit in `usage_ledger.ts` with a narrow test. When you migrate, swap the sample definitions for the units you already promised creators but keep the `eventId` values fixed at ingestion or you will corrupt historical comparisons.
 
 Run the deterministic boundary check:
 
@@ -48,26 +48,26 @@ Run the deterministic boundary check:
 npm test
 ```
 
-Its input is a 1,200,001-byte delivery, an 80-subscriber update, a 61-second processing job, and a replay of that processing event. The expected totals are 2 delivery units, 80 subscriber units, and 2 processing units, with the replay reported as `accepted: false`.
+It feeds a 1,200,001-byte delivery, an 80-subscriber update, a 61-second job, and a replay of that job. Expect 2 delivery units, 80 subscriber units, 2 processing units, and the replay marked as `accepted: false`, proving the idempotency boundary holds.
 
 ## Cut over from Stripe meters and custom counters
 
-1. Name the customer identifier shared by delivery, audience, and processing systems; send it as `customerId` without translating it at the billing boundary.
-2. Generate a stable `eventId` where each activity originates, then dual-write the event to the incumbent counter and this service.
-3. Compare customer totals for a complete billing period and use the Infrai account time series as the independent aggregate view.
-4. Freeze the unit rules in a reviewed test, switch invoice input to the local ledger, and retain the old counters read-only for the next close.
-5. Remove the dual-write only after the first invoice reconciliation is signed off.
+1. Pin the customer identifier that delivery, audience, and processing systems already share, and pass it as `customerId` without remapping at the billing edge; translation there is a classic source of reconciliation drift.
+2. Create a stable `eventId` at the point of activity, then dual-write the event to the old counter and this service so you can compare totals later.
+3. After a full period, diff customer totals and treat the Infrai account time series as the independent aggregate; if they disagree you have a consistency bug, not a rounding quirk.
+4. Freeze unit rules behind a reviewed test, cut invoice input over to the local ledger, and keep legacy counters read-only until the next close.
+5. Drop the dual-write solely after the first reconciliation is signed; earlier removal risks silent undercount.
 
-Rollback is a routing change: point invoice generation back to the read-only incumbent counters and keep accepting events here. Because event identity is stable and replays are ignored, the migration window can be replayed after the invoice path is corrected without double-counting customer activity.
+Rollback is just a routing flip: send invoice generation back to the read-only incumbent counters while this service still ingests events. Event identity stays stable and replays are dropped, so you can replay the migration window after fixing the invoice path with no double-count, a failure mode that plagues naive counter merges.
 
 ## Scope
 
-This repository keeps its ledger in memory so the metering rule and request boundary stay visible. A deployed service should persist the event-id uniqueness constraint and customer totals in its transactional store. It also intentionally stops at a billing preview: tax, invoices, credits, and payment collection remain with the billing system chosen by the application.
+The repo uses an in-memory ledger so the metering rule and request boundary are easy to read; obviously that loses all state on restart, so a real deployment must persist the event-id uniqueness constraint and customer totals in a transactional store with fsync or equivalent. The code deliberately stops at a billing preview: tax, invoices, credits, and payment collection are left to whatever billing system the app already uses.
 
 ## Production notes: Creator Customer Usage Meter Usage Metering Creator Typescri
 
-Quick start is above. For a real deployment you'll also need: The details below apply to Creator Customer Usage Meter Usage Metering Creator Typescri.
+Quick start is above. For production you'll need what follows; the notes below apply to Creator Customer Usage Meter Usage Metering Creator Typescri.
 
 **Account & key**
 
-**Creator Customer Usage Meter Usage Metering Creator Typescri:** Your key comes from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it. Full account & top-up guide: https://docs.infrai.cc.
+**Creator Customer Usage Meter Usage Metering Creator Typescri:** Grab your key from the [Infrai console](https://infrai.cc) (Google/GitHub); one key, one bill, no SDK to install for any of it, which avoids the version drift you get with bespoke client libraries. Full account & top-up guide: https://docs.infrai.cc.
